@@ -33,6 +33,8 @@ export interface FfmpegJobSnapshot {
   title: string;
   sourceUrl: string;
   fileName: string;
+  /** 服务端输出文件的绝对路径（仅完成态对外可见） */
+  serverPath?: string;
   status: FfmpegJobStatus;
   progress: number;
   speed: string;
@@ -295,6 +297,7 @@ function jobToSnapshot(job: InternalFfmpegJob): FfmpegJobSnapshot {
     title: job.title,
     sourceUrl: job.sourceUrl,
     fileName: job.fileName,
+    serverPath: job.status === 'completed' ? job.outputPath : undefined,
     status: job.status,
     progress: clampProgress(job.progress),
     speed: job.speed,

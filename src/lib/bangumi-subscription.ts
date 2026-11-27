@@ -212,7 +212,7 @@ export function createBangumiSubscription(
     autoCache: true,
     cacheExistingEpisodes,
     intervalHours,
-    downloadChannel: 'browser',
+    downloadChannel: 'ffmpeg',
     lastKnownEpisodeCount: totalEpisodes,
     cachedThroughEpisode: cacheExistingEpisodes ? 0 : totalEpisodes,
     episodeTitles: input.episodeTitles || [],

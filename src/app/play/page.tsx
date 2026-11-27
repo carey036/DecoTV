@@ -3830,10 +3830,6 @@ function PlayPageClient() {
   };
 
   const handleDownloadCurrentEpisode = async () => {
-    await enqueueEpisodeDownload('browser');
-  };
-
-  const handleFfmpegDownloadCurrentEpisode = async () => {
     await enqueueEpisodeDownload('ffmpeg');
   };
 
@@ -5309,15 +5305,7 @@ function PlayPageClient() {
                   className='inline-flex items-center gap-1.5 rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-600 transition hover:bg-emerald-500/20 dark:text-emerald-300'
                 >
                   <Download className='h-4 w-4' />
-                  下载当前集
-                </button>
-                <button
-                  type='button'
-                  onClick={handleFfmpegDownloadCurrentEpisode}
-                  className='inline-flex items-center gap-1.5 rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-1.5 text-sm text-amber-600 transition hover:bg-amber-500/20 dark:text-amber-300'
-                >
-                  <Download className='h-4 w-4' />
-                  FFmpeg 转存下载
+                  下载当前集到服务器
                 </button>
                 <button
                   type='button'

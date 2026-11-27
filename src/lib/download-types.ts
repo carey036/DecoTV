@@ -35,6 +35,8 @@ export interface DownloadTask {
   requestUa?: string;
   ffmpegJobId?: string;
   downloadUrl?: string;
+  /** 服务端落盘路径（ffmpeg 转存完成后可见） */
+  serverPath?: string;
   subscriptionId?: string;
   episodeNumber?: number;
   error?: string;

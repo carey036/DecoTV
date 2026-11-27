@@ -77,6 +77,7 @@ interface FfmpegJobPayload {
   downloadedBytes: number;
   error?: string;
   downloadUrl?: string | null;
+  serverPath?: string;
 }
 
 interface ProxyFetchOptions {
@@ -583,16 +584,6 @@ function triggerBrowserDownload(blob: Blob, fileName: string): void {
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
 }
 
-function triggerDownloadByUrl(url: string, fileName?: string): void {
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  if (fileName) anchor.download = fileName;
-  anchor.style.display = 'none';
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-}
-
 function normalizeRecoveredStatus(status: DownloadStatus): DownloadStatus {
   if (status === 'completed' || status === 'error' || status === 'paused') {
     return status;
@@ -715,6 +706,7 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         ...current,
         ffmpegJobId: job.id,
         downloadUrl: job.downloadUrl || undefined,
+        serverPath: job.serverPath || undefined,
         status: mapFfmpegStatusToTaskStatus(job.status),
         totalSegments: 100,
         downloadedSegments: clampProgressPercent(Math.round(job.progress)),
@@ -731,7 +723,6 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
   const startFfmpegPolling = useCallback(
     (taskId: string, ffmpegJobId: string) => {
       stopFfmpegPolling(taskId);
-      let downloadTriggered = false;
 
       const poll = async () => {
         try {
@@ -751,16 +742,8 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
           if (job.status === 'completed' || job.status === 'error') {
             stopFfmpegPolling(taskId);
           }
-
-          if (
-            job.status === 'completed' &&
-            job.downloadUrl &&
-            !downloadTriggered
-          ) {
-            downloadTriggered = true;
-            const task = getTaskById(taskId);
-            triggerDownloadByUrl(job.downloadUrl, task?.fileName);
-          }
+          // 服务端转存完成即结束：文件已落在服务器下载目录，
+          // 不再自动拉回浏览器（用户要求文件留在服务器）
         } catch (error) {
           stopFfmpegPolling(taskId);
           patchTask(taskId, {
@@ -778,7 +761,7 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
       }, FFMPEG_POLL_INTERVAL_MS);
       ffmpegPollersRef.current.set(taskId, timer);
     },
-    [getTaskById, patchTask, stopFfmpegPolling, syncTaskWithFfmpegJob],
+    [patchTask, stopFfmpegPolling, syncTaskWithFfmpegJob],
   );
 
   const startFfmpegTask = useCallback(
@@ -1294,11 +1277,9 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
       const requestUa =
         request.ua?.trim() ||
         (typeof navigator !== 'undefined' ? navigator.userAgent : undefined);
-      const requestedChannel: DownloadChannel =
-        request.channel === 'ffmpeg' ? 'ffmpeg' : 'browser';
-      const downloadChannel: DownloadChannel = isM3U8
-        ? requestedChannel
-        : 'browser';
+      // 统一走服务端 FFmpeg 转存：文件落到服务器下载目录，不拉回浏览器。
+      // browser 通道仅作为 FFmpeg 不可用时的降级兜底。
+      const downloadChannel: DownloadChannel = 'ffmpeg';
       const id = createDownloadId();
       const fileNameBase = sanitizeFileName(
         request.fileNameHint || request.title || 'deco-video',
@@ -1308,7 +1289,7 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         id,
         title: request.title,
         sourceUrl,
-        fileName: `${fileNameBase}${isM3U8 ? (downloadChannel === 'ffmpeg' ? '.mp4' : '.ts') : ''}`,
+        fileName: `${fileNameBase}.mp4`,
         mediaType: isM3U8 ? 'm3u8' : 'file',
         downloadChannel,
         requestReferer,
@@ -1316,12 +1297,8 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         requestUa,
         subscriptionId: request.subscriptionId,
         episodeNumber: request.episodeNumber,
-        status: isM3U8
-          ? downloadChannel === 'ffmpeg'
-            ? 'queued'
-            : 'parsing'
-          : 'queued',
-        totalSegments: isM3U8 ? (downloadChannel === 'ffmpeg' ? 100 : 0) : 1,
+        status: 'queued',
+        totalSegments: 100,
         downloadedSegments: 0,
         downloadedBytes: 0,
         totalBytes: 0,
@@ -1338,43 +1315,42 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         setIsManagerOpen(true);
       }
 
-      if (isM3U8) {
-        let activeTask = task;
-
-        if (downloadChannel === 'ffmpeg') {
-          try {
-            await startFfmpegTask(id, task);
-            return id;
-          } catch (error) {
-            if (!shouldFallbackFfmpegToBrowser(error)) {
-              patchTask(id, {
-                status: 'error',
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : 'FFmpeg 转存任务启动失败',
-              });
-              return id;
-            }
-
-            activeTask = {
-              ...task,
-              downloadChannel: 'browser',
-              status: 'parsing',
-              totalSegments: 0,
-              downloadedSegments: 0,
-              downloadedBytes: 0,
-              totalBytes: 0,
-              mergeProgress: 0,
-              speedBps: 0,
-              fileName: `${fileNameBase}.ts`,
-              error: '当前环境不支持 FFmpeg，已自动改用浏览器分片下载',
-              updatedAt: Date.now(),
-            };
-            upsertTask(activeTask);
-          }
+      // 优先服务端 FFmpeg 转存（m3u8 与直链都支持），文件落服务器不回传浏览器
+      try {
+        await startFfmpegTask(id, task);
+        return id;
+      } catch (error) {
+        if (!shouldFallbackFfmpegToBrowser(error)) {
+          patchTask(id, {
+            status: 'error',
+            error:
+              error instanceof Error
+                ? error.message
+                : 'FFmpeg 转存任务启动失败',
+          });
+          return id;
         }
+        // 仅当服务端明确不支持 FFmpeg（如 Serverless）时才降级到浏览器
+      }
 
+      // ---- 浏览器降级兜底：分片/单文件下载后触发浏览器保存 ----
+      const activeTask: DownloadTask = {
+        ...task,
+        downloadChannel: 'browser',
+        status: isM3U8 ? 'parsing' : 'queued',
+        totalSegments: 0,
+        downloadedSegments: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        mergeProgress: 0,
+        speedBps: 0,
+        fileName: `${fileNameBase}${isM3U8 ? '.ts' : ''}`,
+        error: '当前环境不支持 FFmpeg，已降级为浏览器下载',
+        updatedAt: Date.now(),
+      };
+      upsertTask(activeTask);
+
+      if (isM3U8) {
         try {
           const parsed = await parseM3U8Playlist(sourceUrl, 0, {
             referer: requestReferer,

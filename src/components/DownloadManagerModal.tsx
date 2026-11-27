@@ -142,6 +142,11 @@ function DownloadManagerModal({
                             <span>{formatBytes(task.downloadedBytes)}</span>
                           )}
                         </div>
+                        {task.status === 'completed' && task.serverPath && (
+                          <p className='mt-1 truncate text-[11px] text-emerald-700 dark:text-emerald-300'>
+                            文件位置：{task.serverPath}
+                          </p>
+                        )}
                       </div>
 
                       <div className='flex items-center gap-1.5'>
@@ -210,7 +215,9 @@ function DownloadManagerModal({
                         {task.status === 'completed' && (
                           <span className='inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-200'>
                             <CheckCircle2 className='h-3.5 w-3.5' />
-                            已导出
+                            {task.downloadChannel === 'ffmpeg'
+                              ? '已保存到服务器'
+                              : '已导出'}
                           </span>
                         )}
                         {task.status === 'error' && task.error && (
