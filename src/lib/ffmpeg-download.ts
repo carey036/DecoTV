@@ -182,6 +182,37 @@ function normalizeHeaderValue(value: string | undefined): string | undefined {
   return normalized;
 }
 
+/**
+ * 部分资源站把 MPEG-TS 视频分片伪装成 .jpeg/.html 等非常规扩展名，
+ * 而 ffmpeg 8.0+ 的 hls demuxer 新增了 allowed_segment_extensions 白名单
+ * （默认不含 jpeg），导致转存报 "not in allowed_segment_extensions" 失败。
+ * 这些参数放宽分片扩展名限制。
+ *
+ * 注意：它们是 hls demuxer 的私有选项，对 mp4/ts 直链输入添加会报
+ * "Option allowed_extensions not found" 并致命失败，因此只能对 HLS 源条件化使用。
+ */
+const HLS_SEGMENT_ALLOW_ARGS: string[] = [
+  '-allowed_extensions',
+  'ALL',
+  '-allowed_segment_extensions',
+  'ALL',
+  '-extension_picky',
+  '0',
+];
+
+/**
+ * 仅在确认为 HLS 播放列表时返回放行参数，避免破坏普通直链下载。
+ * 依据：URL（含被编码进代理 ?url=... 的原始地址、以及 m3u8-filter/m3u8-asset
+ * 端点路径）中出现 m3u8 关键字。普通 .mp4/.ts 直链不会包含，故安全。
+ */
+export function isHlsSource(sourceUrl: string): boolean {
+  return /m3u8/i.test(sourceUrl);
+}
+
+function hlsAllowArgs(sourceUrl: string): string[] {
+  return isHlsSource(sourceUrl) ? HLS_SEGMENT_ALLOW_ARGS : [];
+}
+
 function buildFfmpegHttpInputArgs(
   headers: FfmpegRequestHeaders | undefined,
 ): string[] {
@@ -275,6 +306,7 @@ async function probeDurationSeconds(
         'format=duration',
         '-of',
         'default=noprint_wrappers=1:nokey=1',
+        ...hlsAllowArgs(sourceUrl),
         ...buildFfmpegHttpInputArgs(requestHeaders),
         sourceUrl,
       ],
@@ -352,6 +384,7 @@ async function runQueuedJob(job: InternalFfmpegJob): Promise<void> {
     '-loglevel',
     'error',
     '-y',
+    ...hlsAllowArgs(job.sourceUrl),
     ...buildFfmpegHttpInputArgs(job.requestHeaders),
     '-i',
     job.sourceUrl,
