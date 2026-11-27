@@ -3,7 +3,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
-import { getConfig, refineConfig } from '@/lib/config';
+import { getAvailableApiSites, getConfig, refineConfig } from '@/lib/config';
 import { db } from '@/lib/db';
 import { fetchVideoDetail } from '@/lib/fetchVideoDetail';
 import { refreshLiveChannels } from '@/lib/live';
@@ -133,6 +133,13 @@ async function refreshRecordAndFavorites() {
     if (process.env.USERNAME && !users.includes(process.env.USERNAME)) {
       users.push(process.env.USERNAME);
     }
+    // 当前仍启用的资源站集合。播放记录里常残留已被删除的旧源，
+    // 跳过它们避免每轮 cron 刷「无效的API来源」/超时错误。
+    const availableSources = new Set(
+      (await getAvailableApiSites()).map((site) => site.key),
+    );
+    let skippedLegacySources = 0;
+
     // 函数级缓存：key 为 `${source}+${id}`，值为 Promise<VideoDetail | null>
     const detailCache = new Map<string, Promise<SearchResult | null>>();
 
@@ -182,6 +189,10 @@ async function refreshRecordAndFavorites() {
             const id = separatorIndex > 0 ? key.slice(separatorIndex + 1) : '';
             if (!source || !id) {
               console.warn(`跳过无效的播放记录键: ${key}`);
+              continue;
+            }
+            if (!availableSources.has(source)) {
+              skippedLegacySources += 1;
               continue;
             }
 
@@ -241,6 +252,10 @@ async function refreshRecordAndFavorites() {
               console.warn(`跳过无效的收藏键: ${key}`);
               continue;
             }
+            if (!availableSources.has(source)) {
+              skippedLegacySources += 1;
+              continue;
+            }
 
             const favDetail = await getDetail(source, id, fav.title);
             if (!favDetail) {
@@ -277,7 +292,9 @@ async function refreshRecordAndFavorites() {
       }
     }
 
-    console.log('刷新播放记录/收藏任务完成');
+    console.log(
+      `刷新播放记录/收藏任务完成（跳过 ${skippedLegacySources} 条已失效资源站记录）`,
+    );
   } catch (err) {
     console.error('刷新播放记录/收藏任务启动失败', err);
   }
