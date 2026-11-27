@@ -123,6 +123,13 @@ function sanitizeSubscription(raw: unknown): BangumiSubscription | null {
     0,
     item.cachedThroughEpisode ?? lastKnownEpisodeCount,
   );
+  const cacheExistingEpisodes = item.cacheExistingEpisodes === true;
+  // 迁移：开启了补历史集、但历史集尚未缓存完成、且从未检查过的订阅，
+  // 立即到期以触发补下（修复旧版本订阅 nextCheckAt 落在 24 小时后的问题）
+  const needsBackfill =
+    cacheExistingEpisodes &&
+    cachedThroughEpisode < lastKnownEpisodeCount &&
+    !item.lastCheckedAt;
 
   return {
     id,
@@ -136,7 +143,7 @@ function sanitizeSubscription(raw: unknown): BangumiSubscription | null {
     enabled: item.enabled !== false,
     autoCache: item.autoCache !== false,
     // 旧订阅没有该字段时保持原有语义（不补历史集），避免升级后突然下载全部剧集
-    cacheExistingEpisodes: item.cacheExistingEpisodes === true,
+    cacheExistingEpisodes,
     intervalHours,
     downloadChannel: item.downloadChannel === 'ffmpeg' ? 'ffmpeg' : 'browser',
     lastKnownEpisodeCount,
@@ -146,8 +153,9 @@ function sanitizeSubscription(raw: unknown): BangumiSubscription | null {
       : [],
     createdAt: item.createdAt || now,
     updatedAt: item.updatedAt || now,
-    nextCheckAt:
-      typeof item.nextCheckAt === 'number'
+    nextCheckAt: needsBackfill
+      ? now
+      : typeof item.nextCheckAt === 'number'
         ? item.nextCheckAt
         : getNextBangumiCheckAt(intervalHours, now),
     lastCheckedAt: item.lastCheckedAt,
@@ -210,7 +218,11 @@ export function createBangumiSubscription(
     episodeTitles: input.episodeTitles || [],
     createdAt: now,
     updatedAt: now,
-    nextCheckAt: getNextBangumiCheckAt(intervalHours, now),
+    // 补历史集时必须立即到期，让前端下一次轮询马上补下已播出剧集；
+    // 否则默认 24 小时后才首次检查，用户会觉得「订阅了但没下载」
+    nextCheckAt: cacheExistingEpisodes
+      ? now
+      : getNextBangumiCheckAt(intervalHours, now),
     status: 'idle',
   };
 }

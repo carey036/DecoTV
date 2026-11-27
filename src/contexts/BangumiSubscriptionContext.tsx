@@ -160,6 +160,8 @@ export function BangumiSubscriptionProvider({
   const subscriptionsRef = useRef<BangumiSubscription[]>([]);
   const tasksRef = useRef(tasks);
   const checkingIdsRef = useRef<Set<string>>(new Set());
+  // 转发检查函数，供 subscribeFromDetail 在创建订阅后立即触发补下
+  const checkAllRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     tasksRef.current = tasks;
@@ -270,6 +272,10 @@ export function BangumiSubscriptionProvider({
             : item,
         );
       });
+
+      // 订阅后立刻触发一次检查，让「补历史集」马上开始下载，
+      // 不必等下一次 60 秒轮询
+      window.setTimeout(() => checkAllRef.current(), 0);
     },
     [persist],
   );
@@ -473,6 +479,12 @@ export function BangumiSubscriptionProvider({
     },
     [checkSubscription],
   );
+
+  useEffect(() => {
+    checkAllRef.current = () => {
+      void checkAllSubscriptions();
+    };
+  }, [checkAllSubscriptions]);
 
   useEffect(() => {
     if (!loaded) return;
