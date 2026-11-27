@@ -13,10 +13,23 @@ export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
   console.log(request.url);
+
+  // 配置 CRON_SECRET 后要求鉴权，避免任何人都能触发刷新任务
+  const cronSecret = process.env.CRON_SECRET?.trim();
+  if (cronSecret) {
+    const provided =
+      request.nextUrl.searchParams.get('secret') ||
+      request.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
+    if (provided !== cronSecret) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+  }
+
   try {
     console.log('Cron job triggered:', new Date().toISOString());
 
-    cronJob();
+    // 等待任务真正完成，否则异常无法被捕获且 serverless 环境会冻结掉后台任务
+    await cronJob();
 
     return NextResponse.json({
       success: true,
@@ -162,7 +175,11 @@ async function refreshRecordAndFavorites() {
 
         for (const [key, record] of Object.entries(playRecords)) {
           try {
-            const [source, id] = key.split('+');
+            // 按首个 + 切分：source 为站点 key（不含 +），id 本身可能含 +
+            const separatorIndex = key.indexOf('+');
+            const source =
+              separatorIndex > 0 ? key.slice(0, separatorIndex) : '';
+            const id = separatorIndex > 0 ? key.slice(separatorIndex + 1) : '';
             if (!source || !id) {
               console.warn(`跳过无效的播放记录键: ${key}`);
               continue;
@@ -216,7 +233,10 @@ async function refreshRecordAndFavorites() {
 
         for (const [key, fav] of Object.entries(favorites)) {
           try {
-            const [source, id] = key.split('+');
+            const separatorIndex = key.indexOf('+');
+            const source =
+              separatorIndex > 0 ? key.slice(0, separatorIndex) : '';
+            const id = separatorIndex > 0 ? key.slice(separatorIndex + 1) : '';
             if (!source || !id) {
               console.warn(`跳过无效的收藏键: ${key}`);
               continue;

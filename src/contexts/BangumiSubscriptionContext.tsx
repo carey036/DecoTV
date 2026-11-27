@@ -112,6 +112,37 @@ function getEpisodeLabel(detail: SearchResult, episodeIndex: number): string {
   return detail.episodes_titles?.[episodeIndex] || `第${episodeIndex + 1}集`;
 }
 
+const SIGNATURE_QUERY_KEYS = new Set([
+  'sign',
+  'signature',
+  'token',
+  'auth',
+  'auth_key',
+  'expires',
+  'expire',
+  'timestamp',
+  't',
+  'nonce',
+  'temp',
+]);
+
+/** 去掉通常用于防盗链的签名参数，让带签名的 URL 也能稳定去重 */
+function stripSignatureParams(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    let changed = false;
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (SIGNATURE_QUERY_KEYS.has(key.toLowerCase())) {
+        parsed.searchParams.delete(key);
+        changed = true;
+      }
+    }
+    return changed ? parsed.toString() : rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
 export function BangumiSubscriptionProvider({
   children,
 }: {
@@ -263,14 +294,28 @@ export function BangumiSubscriptionProvider({
 
   const hasExistingEpisodeTask = useCallback(
     (subscriptionId: string, episodeNumber: number, sourceUrl: string) => {
+      // 失败任务应允许重新入队，否则某一集失败后永远不会再试
+      const retryableStatuses = new Set([
+        'queued',
+        'parsing',
+        'running',
+        'merging',
+        'paused',
+        'completed',
+      ]);
       return tasksRef.current.some((task) => {
+        if (!retryableStatuses.has(task.status)) return false;
         if (
           task.subscriptionId === subscriptionId &&
           task.episodeNumber === episodeNumber
         ) {
           return true;
         }
-        return task.sourceUrl === sourceUrl && task.status !== 'error';
+        // 跨订阅同 URL 去重时先去掉签名类参数，避免签名刷新后重复下载
+        return (
+          stripSignatureParams(task.sourceUrl) ===
+          stripSignatureParams(sourceUrl)
+        );
       });
     },
     [],
@@ -317,12 +362,9 @@ export function BangumiSubscriptionProvider({
       if (!subscription) return;
 
       const now = Date.now();
-      if (
-        !options.force &&
-        (!subscription.enabled || subscription.nextCheckAt > now)
-      ) {
-        return;
-      }
+      // force 只能绕过检查周期，禁用的订阅仍然跳过
+      if (!subscription.enabled) return;
+      if (!options.force && subscription.nextCheckAt > now) return;
       if (checkingIdsRef.current.has(subscriptionId)) return;
 
       checkingIdsRef.current.add(subscriptionId);
@@ -336,10 +378,15 @@ export function BangumiSubscriptionProvider({
       try {
         const detail = await fetchSubscriptionDetail(subscription);
         const episodeCount = detail.episodes?.length || 0;
-        let cachedThroughEpisode = subscription.cachedThroughEpisode;
+        // 以最新快照为准，避免使用检查发起时的陈旧值覆盖用户在检查期间的修改
+        const current = subscriptionsRef.current.find(
+          (item) => item.id === subscriptionId,
+        );
+        const base = current || subscription;
+        let cachedThroughEpisode = base.cachedThroughEpisode;
         let cachedCount = 0;
 
-        if (subscription.autoCache && episodeCount > cachedThroughEpisode) {
+        if (base.autoCache && episodeCount > cachedThroughEpisode) {
           for (
             let episodeIndex = cachedThroughEpisode;
             episodeIndex < episodeCount;
@@ -350,23 +397,20 @@ export function BangumiSubscriptionProvider({
               detail,
               episodeIndex,
             );
-            if (cacheResult) {
+            // 单集无 URL 只跳过该集，不中断后续剧集
+            if (cacheResult === false) continue;
+            // 'exists' 不推进缓存进度：该集可能尚未真正下载完成
+            if (cacheResult === 'queued') {
               cachedThroughEpisode = episodeIndex + 1;
-              if (cacheResult === 'queued') {
-                cachedCount += 1;
-              }
-            } else {
-              break;
+              cachedCount += 1;
             }
           }
-        } else if (!subscription.autoCache) {
-          cachedThroughEpisode = Math.max(cachedThroughEpisode, episodeCount);
         }
 
         const checkedAt = Date.now();
         const newEpisodeCount = Math.max(
           0,
-          episodeCount - subscription.lastKnownEpisodeCount,
+          episodeCount - base.lastKnownEpisodeCount,
         );
 
         patchSubscription(subscriptionId, (current) => ({

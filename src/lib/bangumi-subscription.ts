@@ -19,6 +19,8 @@ export interface BangumiSubscription {
   searchTitle?: string;
   enabled: boolean;
   autoCache: boolean;
+  /** 订阅时是否把已播出的剧集也纳入缓存（默认开启） */
+  cacheExistingEpisodes: boolean;
   intervalHours: number;
   downloadChannel: DownloadChannel;
   lastKnownEpisodeCount: number;
@@ -44,11 +46,14 @@ export interface BangumiSubscriptionInput {
   searchTitle?: string;
   totalEpisodes: number;
   episodeTitles?: string[];
+  cacheExistingEpisodes?: boolean;
 }
 
 export interface BangumiSubscriptionUpdate {
   enabled?: boolean;
   autoCache?: boolean;
+  /** 开启后从第一集补下历史剧集；关闭后仅缓存未来新增集 */
+  cacheExistingEpisodes?: boolean;
   intervalHours?: number;
   downloadChannel?: DownloadChannel;
 }
@@ -130,6 +135,8 @@ function sanitizeSubscription(raw: unknown): BangumiSubscription | null {
     searchTitle: item.searchTitle || item.title,
     enabled: item.enabled !== false,
     autoCache: item.autoCache !== false,
+    // 旧订阅没有该字段时保持原有语义（不补历史集），避免升级后突然下载全部剧集
+    cacheExistingEpisodes: item.cacheExistingEpisodes === true,
     intervalHours,
     downloadChannel: item.downloadChannel === 'ffmpeg' ? 'ffmpeg' : 'browser',
     lastKnownEpisodeCount,
@@ -181,6 +188,8 @@ export function createBangumiSubscription(
   const now = Date.now();
   const totalEpisodes = Math.max(0, input.totalEpisodes || 0);
   const intervalHours = DEFAULT_INTERVAL_HOURS;
+  // 新订阅默认补下已播出的全部剧集，从 0 开始；关闭时才跳过历史集
+  const cacheExistingEpisodes = input.cacheExistingEpisodes !== false;
 
   return {
     id: createBangumiSubscriptionId(input.source, input.videoId),
@@ -193,10 +202,11 @@ export function createBangumiSubscription(
     searchTitle: input.searchTitle || input.title,
     enabled: true,
     autoCache: true,
+    cacheExistingEpisodes,
     intervalHours,
     downloadChannel: 'browser',
     lastKnownEpisodeCount: totalEpisodes,
-    cachedThroughEpisode: totalEpisodes,
+    cachedThroughEpisode: cacheExistingEpisodes ? 0 : totalEpisodes,
     episodeTitles: input.episodeTitles || [],
     createdAt: now,
     updatedAt: now,
@@ -234,13 +244,23 @@ export function applyBangumiSubscriptionUpdate(
       ? subscription.intervalHours
       : normalizeBangumiIntervalHours(update.intervalHours);
 
+  // 从「不补历史」切到「补历史」时重置进度，让下一次检查补下已播出集数
+  const shouldBackfill =
+    update.cacheExistingEpisodes === true &&
+    subscription.cacheExistingEpisodes === false;
+
   return {
     ...subscription,
     ...update,
     intervalHours,
     updatedAt: Date.now(),
-    nextCheckAt:
-      update.intervalHours === undefined
+    cachedThroughEpisode: shouldBackfill
+      ? 0
+      : subscription.cachedThroughEpisode,
+    // 补历史时立即到期，让下一次轮询马上补下
+    nextCheckAt: shouldBackfill
+      ? Date.now()
+      : update.intervalHours === undefined
         ? subscription.nextCheckAt
         : getNextBangumiCheckAt(intervalHours),
     downloadChannel:

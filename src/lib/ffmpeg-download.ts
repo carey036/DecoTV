@@ -18,6 +18,8 @@ const MAX_PROGRESS = 100;
 const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 2;
 const FFMPEG_SUPPORT_CACHE_TTL_MS = 30_000;
+// ffprobe 探测时长失败时的兜底估算（24 分钟），避免进度一直卡在 0
+const DEFAULT_ESTIMATED_DURATION_SECONDS = 24 * 60;
 
 export type FfmpegJobStatus =
   | 'queued'
@@ -394,14 +396,14 @@ async function runQueuedJob(job: InternalFfmpegJob): Promise<void> {
         job.speed = value;
       } else if (key === 'out_time_ms') {
         const outTimeMs = Number.parseInt(value, 10);
-        if (
-          Number.isFinite(outTimeMs) &&
-          outTimeMs > 0 &&
-          job.durationSeconds &&
-          job.durationSeconds > 0
-        ) {
+        // 探测失败时用估算时长兜底，保证进度条仍然推进
+        const duration =
+          job.durationSeconds && job.durationSeconds > 0
+            ? job.durationSeconds
+            : DEFAULT_ESTIMATED_DURATION_SECONDS;
+        if (Number.isFinite(outTimeMs) && outTimeMs > 0 && duration > 0) {
           const outSeconds = outTimeMs / 1_000_000;
-          const progress = (outSeconds / job.durationSeconds) * 100;
+          const progress = (outSeconds / duration) * 100;
           job.progress = clampProgress(Math.min(99.5, progress));
         }
       } else if (key === 'progress' && value === 'end') {

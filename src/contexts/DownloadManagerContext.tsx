@@ -24,6 +24,12 @@ import {
   saveSegmentBlobToDB,
 } from '@/lib/download-idb';
 import {
+  mergeSegmentsStreaming,
+  removeOpfsFile,
+  triggerFileDownload,
+  writeSingleFileStreaming,
+} from '@/lib/download-stream';
+import {
   createDownloadId,
   DownloadChannel,
   DownloadRequest,
@@ -45,6 +51,8 @@ const MAX_SEGMENT_RETRY = 4;
 const SEGMENT_RETRY_BASE_DELAY_MS = 400;
 const SEGMENT_FETCH_TIMEOUT_MS = 45_000;
 const PROGRESS_PATCH_MIN_INTERVAL_MS = 180;
+const TASK_PERSIST_THROTTLE_MS = 1000;
+const SINGLE_FILE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const SPEED_WINDOW_MS = 5000;
 const FFMPEG_POLL_INTERVAL_MS = 1200;
 
@@ -608,22 +616,62 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
     return tasksRef.current.find((task) => task.id === taskId) || null;
   }, []);
 
-  const upsertTask = useCallback((task: DownloadTask) => {
-    setTasks((prev) => {
-      const existingIndex = prev.findIndex((item) => item.id === task.id);
-      let next: DownloadTask[];
-      if (existingIndex === -1) {
-        next = [task, ...prev];
-      } else {
-        next = [...prev];
-        next[existingIndex] = task;
-      }
+  // 待写入 IndexedDB 的任务按 id 合并，批量节流落盘。
+  // 避免在每个 setState updater 内做有副作用的异步写（StrictMode 下会双写），
+  // 也避免高频进度更新造成的 IDB 写风暴。
+  const dirtyTasksRef = useRef<Map<string, DownloadTask>>(new Map());
+  const persistTimerRef = useRef<number | null>(null);
+
+  const flushDirtyTasks = useCallback(() => {
+    persistTimerRef.current = null;
+    const batch = Array.from(dirtyTasksRef.current.values());
+    dirtyTasksRef.current.clear();
+    for (const task of batch) {
       void saveDownloadTaskToDB(task).catch((error) => {
         console.warn('[DownloadManager] Failed to persist task:', error);
       });
-      return next;
-    });
+    }
   }, []);
+
+  const markDirty = useCallback(
+    (task: DownloadTask) => {
+      dirtyTasksRef.current.set(task.id, task);
+      if (persistTimerRef.current === null) {
+        persistTimerRef.current = window.setTimeout(
+          flushDirtyTasks,
+          TASK_PERSIST_THROTTLE_MS,
+        );
+      }
+    },
+    [flushDirtyTasks],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        flushDirtyTasks();
+      }
+    };
+  }, [flushDirtyTasks]);
+
+  const upsertTask = useCallback(
+    (task: DownloadTask) => {
+      setTasks((prev) => {
+        const existingIndex = prev.findIndex((item) => item.id === task.id);
+        let next: DownloadTask[];
+        if (existingIndex === -1) {
+          next = [task, ...prev];
+        } else {
+          next = [...prev];
+          next[existingIndex] = task;
+        }
+        return next;
+      });
+      markDirty(task);
+    },
+    [markDirty],
+  );
 
   const patchTask = useCallback(
     (
@@ -632,6 +680,7 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         | Partial<DownloadTask>
         | ((current: DownloadTask) => DownloadTask),
     ) => {
+      let patched: DownloadTask | null = null;
       setTasks((prev) => {
         const index = prev.findIndex((task) => task.id === taskId);
         if (index === -1) return prev;
@@ -644,16 +693,12 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
 
         const next = [...prev];
         next[index] = nextTask;
-        void saveDownloadTaskToDB(nextTask).catch((error) => {
-          console.warn(
-            '[DownloadManager] Failed to persist task patch:',
-            error,
-          );
-        });
+        patched = nextTask;
         return next;
       });
+      if (patched) markDirty(patched as DownloadTask);
     },
-    [],
+    [markDirty],
   );
 
   const stopFfmpegPolling = useCallback((taskId: string) => {
@@ -782,26 +827,31 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         speedBps: 0,
       });
 
-      const parts: Blob[] = [];
-      for (let index = 0; index < task.totalSegments; index += 1) {
-        const segmentBlob = await readSegmentBlobFromDB(taskId, index);
-        if (!segmentBlob) {
-          throw new Error(`分片 ${index + 1} 缺失，无法合并`);
-        }
-        parts.push(segmentBlob);
-
-        if (index % 8 === 0 || index === task.totalSegments - 1) {
-          patchTask(taskId, {
-            mergeProgress: ((index + 1) / task.totalSegments) * 100,
-          });
-        }
-      }
-
-      const isMp4Output = /\.mp4$/i.test(task.fileName);
-      const finalBlob = new Blob(parts, {
-        type: isMp4Output ? 'video/mp4' : 'video/mp2t',
+      // 流式合并：优先写入 OPFS，避免把整部剧的分片全堆在内存里导致 OOM
+      const result = await mergeSegmentsStreaming({
+        taskId,
+        fileName: task.fileName,
+        totalSegments: task.totalSegments,
+        readSegment: (index) => readSegmentBlobFromDB(taskId, index),
+        onProgress: (merged) => {
+          if (merged % 8 === 0 || merged === task.totalSegments) {
+            patchTask(taskId, {
+              mergeProgress: (merged / task.totalSegments) * 100,
+            });
+          }
+        },
       });
-      triggerBrowserDownload(finalBlob, task.fileName);
+
+      const finalSize = result.file?.size ?? result.blob?.size ?? 0;
+      if (result.file) {
+        triggerFileDownload(result.file, task.fileName);
+        // 下载已交给浏览器处理，OPFS 副本随后清理，避免长期占用磁盘
+        window.setTimeout(() => {
+          void removeOpfsFile(taskId, task.fileName);
+        }, 30_000);
+      } else if (result.blob) {
+        triggerBrowserDownload(result.blob, task.fileName);
+      }
 
       await clearTaskSegmentsFromDB(taskId);
 
@@ -809,8 +859,8 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         status: 'completed',
         mergeProgress: 100,
         downloadedSegments: task.totalSegments,
-        totalBytes: task.downloadedBytes || finalBlob.size,
-        downloadedBytes: task.downloadedBytes || finalBlob.size,
+        totalBytes: task.downloadedBytes || finalSize,
+        downloadedBytes: task.downloadedBytes || finalSize,
         speedBps: 0,
       });
     },
@@ -1107,6 +1157,13 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
       const controller = new AbortController();
       runtime.controllers.add(controller);
 
+      // 整次下载的总超时，避免上游无响应时永久挂起
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, SINGLE_FILE_DOWNLOAD_TIMEOUT_MS);
+
       try {
         const taskMeta = getTaskById(taskId);
         patchTask(taskId, {
@@ -1139,63 +1196,61 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
         const totalBytes = Number(response.headers.get('content-length') || 0);
         patchTask(taskId, { totalBytes });
 
-        const chunks: ArrayBuffer[] = [];
-        let loaded = 0;
+        const task = getTaskById(taskId);
+        if (!task) return;
 
-        if (response.body) {
-          const reader = response.body.getReader();
-          while (runtime.active) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-            const chunk = new Uint8Array(value);
-            chunks.push(chunk.buffer);
-            loaded += chunk.byteLength;
-            const speedBps = computeSpeed(runtime, chunk.byteLength);
+        // 单文件也走 OPFS 流式落盘，避免把所有 chunk 堆在内存里
+        const streamed = await writeSingleFileStreaming({
+          taskId,
+          fileName: task.fileName,
+          mimeType:
+            response.headers.get('content-type') || 'application/octet-stream',
+          body: response.body,
+          fallbackBlob: response.body ? null : await response.blob(),
+          isActive: () => runtime.active,
+          onProgress: (loaded, speedBps) => {
             patchTask(taskId, {
               downloadedBytes: loaded,
               downloadedSegments: loaded > 0 ? 1 : 0,
               speedBps,
-              totalBytes,
+              totalBytes: totalBytes || loaded,
             });
-          }
-        } else {
-          const blob = await response.blob();
-          const bytes = new Uint8Array(await blob.arrayBuffer());
-          chunks.push(bytes.buffer);
-          loaded = bytes.byteLength;
-          patchTask(taskId, {
-            downloadedBytes: loaded,
-            downloadedSegments: loaded > 0 ? 1 : 0,
-            totalBytes: loaded,
-          });
-        }
+          },
+        });
 
         if (!runtime.active) {
           patchTask(taskId, { status: 'paused', speedBps: 0 });
           return;
         }
 
-        const fileBlob = new Blob(chunks, {
-          type:
-            response.headers.get('content-type') || 'application/octet-stream',
-        });
-        const task = getTaskById(taskId);
-        if (!task) return;
+        if (streamed.file) {
+          triggerFileDownload(streamed.file, task.fileName);
+          window.setTimeout(() => {
+            void removeOpfsFile(taskId, task.fileName);
+          }, 30_000);
+        } else if (streamed.blob) {
+          triggerBrowserDownload(streamed.blob, task.fileName);
+        }
 
-        triggerBrowserDownload(fileBlob, task.fileName);
+        const finalSize = streamed.file?.size ?? streamed.blob?.size ?? 0;
         patchTask(taskId, {
           status: 'completed',
           downloadedSegments: 1,
           totalSegments: 1,
-          downloadedBytes: fileBlob.size,
-          totalBytes: fileBlob.size,
+          downloadedBytes: finalSize,
+          totalBytes: finalSize,
           speedBps: 0,
           mergeProgress: 100,
         });
       } catch (error) {
-        if ((error as Error).name === 'AbortError') {
+        if (!runtime.active) {
           patchTask(taskId, { status: 'paused', speedBps: 0 });
+        } else if (timedOut) {
+          patchTask(taskId, {
+            status: 'error',
+            speedBps: 0,
+            error: '文件下载超时，请稍后重试',
+          });
         } else {
           patchTask(taskId, {
             status: 'error',
@@ -1207,6 +1262,7 @@ export function DownloadManagerProvider({ children }: { children: ReactNode }) {
           });
         }
       } finally {
+        window.clearTimeout(timeoutId);
         runtime.controllers.delete(controller);
         runtimeMapRef.current.delete(taskId);
       }

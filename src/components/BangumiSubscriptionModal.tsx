@@ -124,7 +124,6 @@ function BangumiSubscriptionModal({
 }: BangumiSubscriptionModalProps) {
   const [mounted, setMounted] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
-  const [checkingIds, setCheckingIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setMounted(true);
@@ -150,16 +149,7 @@ function BangumiSubscriptionModal({
   );
 
   const handleCheck = async (subscriptionId: string) => {
-    setCheckingIds((prev) => new Set(prev).add(subscriptionId));
-    try {
-      await onCheck(subscriptionId, { force: true });
-    } finally {
-      setCheckingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(subscriptionId);
-        return next;
-      });
-    }
+    await onCheck(subscriptionId, { force: true });
   };
 
   const handleCheckAll = async () => {
@@ -234,9 +224,7 @@ function BangumiSubscriptionModal({
           ) : (
             <div className='grid gap-3'>
               {sortedSubscriptions.map((subscription) => {
-                const status = checkingIds.has(subscription.id)
-                  ? 'checking'
-                  : subscription.status;
+                const status = subscription.status;
                 return (
                   <article
                     key={subscription.id}
@@ -305,6 +293,15 @@ function BangumiSubscriptionModal({
                               }
                               label='自动缓存'
                             />
+                            <Toggle
+                              checked={subscription.cacheExistingEpisodes}
+                              onChange={(checked) =>
+                                onUpdate(subscription.id, {
+                                  cacheExistingEpisodes: checked,
+                                })
+                              }
+                              label='补历史集'
+                            />
                             <label className='flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-300'>
                               <span>周期</span>
                               <select
@@ -365,10 +362,10 @@ function BangumiSubscriptionModal({
                             <button
                               type='button'
                               onClick={() => handleCheck(subscription.id)}
-                              disabled={checkingIds.has(subscription.id)}
+                              disabled={status === 'checking'}
                               className='inline-flex items-center gap-1.5 rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-700 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:text-cyan-200'
                             >
-                              {checkingIds.has(subscription.id) ? (
+                              {status === 'checking' ? (
                                 <Loader2 className='h-3.5 w-3.5 animate-spin' />
                               ) : (
                                 <RefreshCcw className='h-3.5 w-3.5' />

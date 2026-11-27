@@ -46,6 +46,33 @@ function safeDecodeURIComponent(raw: string): string {
   }
 }
 
+/** 判断解析后的主机名是否指向内网/环回地址，防止 SSRF 探测内网服务 */
+function isPrivateHost(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (hostname.endsWith('.local') || hostname.endsWith('.internal'))
+    return true;
+  if (hostname === '::1' || hostname === '0.0.0.0' || hostname === '::')
+    return true;
+
+  // IPv4 私网段 / 保留段
+  const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 10 || a === 0 || a >= 224) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+
+  // IPv6 唯一本地地址 fc00::/7 与链路本地 fe80::/10
+  if (/^f[cd]/.test(hostname) || /^fe[89ab]/.test(hostname)) return true;
+
+  return false;
+}
+
 function parseHttpUrl(raw: string): URL | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -359,6 +386,14 @@ export async function GET(request: NextRequest) {
   const parsedTarget = parseHttpUrl(targetRaw);
   if (!parsedTarget) {
     return buildError(400, 'Invalid url');
+  }
+
+  // 阻止代理探测内网服务；同源 URL（Docker 内部改写场景）除外
+  if (
+    isPrivateHost(parsedTarget) &&
+    parsedTarget.origin !== getRequestOrigin(request)
+  ) {
+    return buildError(400, 'Private network addresses are not allowed');
   }
 
   const referer = normalizeOptional(
